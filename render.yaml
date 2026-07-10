@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: vouch
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    envVars:
+      - key: XLAYER_RPC
+        sync: false
+      - key: OKX_API_KEY
+        sync: false
+      - key: OKX_SECRET_KEY
+        sync: false
+      - key: OKX_PASSPHRASE
+        sync: false
+      - key: VOUCH_PAYOUT_WALLET
+        sync: false
+      - key: USDT_XLAYER_ADDRESS
+        sync: false
+      - key: VET_PRICE
+        sync: false
+      - key: SELF_URL
+        sync: false
