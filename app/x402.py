@@ -1,13 +1,13 @@
 """OKX x402 payment gating. Facilitator pattern — OKX verifies and settles.
 
-Flow per the OKX Onchain OS payment docs:
-  1. Buyer calls endpoint with no X-PAYMENT header  -> we return 402 + requirements
-  2. Buyer retries with X-PAYMENT (base64 signed payload)
-  3. We POST to OKX /verify. If valid, do the work.
-  4. We POST to OKX /settle. On success:true, return the resource.
+402 body aligned to what OKX's checker and facilitator parse:
+  - x402Version: 2
+  - accepts: [ { scheme, network, amount, asset, payTo, maxTimeoutSeconds, extra } ]
+  - resource advertised both at top level and inside the accepts entry for
+    maximum compatibility with strict and lenient parsers.
 
 X Layer network id (CAIP-2): eip155:196
-Settle/verify base: https://web3.okx.com/api/v6/pay/x402
+Facilitator base: https://web3.okx.com/api/v6/pay/x402
 Auth: OK-ACCESS-* headers signed with API key/secret/passphrase.
 """
 from __future__ import annotations
@@ -23,7 +23,6 @@ import httpx
 
 OKX_BASE = "https://web3.okx.com"
 XLAYER_CAIP2 = "eip155:196"
-# USDT on X Layer. Confirm the exact asset address in the OKX token list before go-live.
 USDT_XLAYER = os.environ.get("USDT_XLAYER_ADDRESS", "")
 PAY_TO = os.environ.get("VOUCH_PAYOUT_WALLET", "")
 
@@ -33,8 +32,8 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
 
 def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 def _sign(ts: str, method: str, path: str, body: str) -> str:
@@ -54,23 +53,24 @@ def _headers(method: str, path: str, body: str) -> dict:
     }
 
 
-def payment_requirements(price_usdt: str, resource_url: str, description: str) -> dict:
-    """The 402 body. amount is in smallest unit; USDT has 6 decimals on most chains.
-    Confirm decimals for X Layer USDT before go-live.
-    """
-    # price given like "1.00" -> smallest unit. Adjust decimals once asset confirmed.
+def payment_requirements(price_smallest_unit: str, resource_url: str,
+                         description: str) -> dict:
+    resource = {"url": resource_url, "description": description,
+                "mimeType": "application/json"}
+    accept = {
+        "scheme": "exact",
+        "network": XLAYER_CAIP2,
+        "amount": price_smallest_unit,
+        "asset": USDT_XLAYER,
+        "payTo": PAY_TO,
+        "maxTimeoutSeconds": 60,
+        "resource": resource,
+        "extra": {"name": "USDT", "version": "1"},
+    }
     return {
         "x402Version": 2,
-        "accepts": [{
-            "scheme": "exact",
-            "network": XLAYER_CAIP2,
-            "amount": price_usdt,        # set as smallest-unit string once decimals confirmed
-            "asset": USDT_XLAYER,
-            "payTo": PAY_TO,
-            "maxTimeoutSeconds": 60,
-            "resource": {"url": resource_url, "description": description,
-                         "mimeType": "application/json"},
-        }],
+        "resource": resource,          # top-level too, for lenient parsers
+        "accepts": [accept],
     }
 
 
@@ -97,6 +97,5 @@ async def settle_payment(client: httpx.AsyncClient, payment_payload: dict,
 
 
 def decode_x_payment(header_value: str) -> dict:
-    """X-PAYMENT header is base64 JSON."""
     raw = base64.b64decode(header_value)
     return json.loads(raw)
