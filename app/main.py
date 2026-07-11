@@ -41,13 +41,34 @@ def _requirements() -> dict:
 
 
 def _challenge(extra: dict | None = None) -> JSONResponse:
-    """Standard 402 with payment terms. The one true unpaid response."""
+    """Standard 402. The payment requirements are carried BOTH ways:
+
+    1. PAYMENT-REQUIRED header: base64-encoded JSON of the requirements.
+       This is what x402 v2 validators parse. An empty or missing header
+       reads as "accepts is empty" regardless of the body.
+    2. JSON body: same object, human- and curl-readable.
+
+    Content-Encoding: identity stops the CDN from brotli-compressing the
+    body for clients that offer br but do not decode it.
+    """
+    import base64 as _b64
+    import json as _json
+
     content = _requirements()
+    header_payload = _b64.b64encode(
+        _json.dumps(content, separators=(",", ":")).encode()
+    ).decode()
     if extra:
         content = {**extra, **content}
-    return JSONResponse(status_code=402, content=content,
-                        headers={"PAYMENT-REQUIRED": "", "Content-Encoding": "identity", "Cache-Control": "no-store"})
-
+    return JSONResponse(
+        status_code=402,
+        content=content,
+        headers={
+            "PAYMENT-REQUIRED": header_payload,
+            "Content-Encoding": "identity",
+            "Cache-Control": "no-store",
+        },
+    )
 
 @app.get("/health")
 async def health():
