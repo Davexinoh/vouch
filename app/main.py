@@ -46,7 +46,7 @@ def _challenge(extra: dict | None = None) -> JSONResponse:
     if extra:
         content = {**extra, **content}
     return JSONResponse(status_code=402, content=content,
-                        headers={"PAYMENT-REQUIRED": ""})
+                        headers={"PAYMENT-REQUIRED": "", "Content-Encoding": "identity", "Cache-Control": "no-store"})
 
 
 @app.get("/health")
