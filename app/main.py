@@ -13,8 +13,9 @@ from fastapi.responses import JSONResponse
 
 from .vetting import vet_agent
 from . import x402
+from .resolver import resolve_agent, ResolveError
 
-app = FastAPI(title="Vouch", version="1.3.0")
+app = FastAPI(title="Vouch", version="1.4.0")
 
 XLAYER_RPC = os.environ.get("XLAYER_RPC", "")
 VET_PRICE = os.environ.get("VET_PRICE", "1000000")
@@ -22,6 +23,12 @@ SELF_URL = os.environ.get("SELF_URL", "https://vouch-4ib4.onrender.com")
 
 READY = {"vet_agent": True}
 ATTEMPTS: deque = deque(maxlen=20)
+
+SAMPLE_AGENT_ID = "4984"
+SAMPLE_TTL_SECONDS = 6 * 3600
+SAMPLE_NOTE = ("This is Vouch's public self-audit. Paid reports run the same "
+               "engine on any agent.")
+_sample_cache: dict = {"report": None, "generated_at": 0.0}
 
 
 def _now_iso() -> str:
@@ -80,6 +87,15 @@ async def vet_agent_probe():
     return _challenge()
 
 
+def _parse_agent_id(body: dict):
+    """int or numeric-string 'agent_id' -> normalized str id, else None."""
+    raw = body.get("agent_id")
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return s if s.isdigit() else ""  # "" signals present-but-invalid
+
+
 @app.post("/vet_agent")
 async def vet_agent_post(request: Request):
     requirements = _requirements()
@@ -101,8 +117,11 @@ async def vet_agent_post(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    agent = body.get("agent", {}) or {}
-    reviews = body.get("reviews", {}) or {}
+    agent_id = _parse_agent_id(body)
+    if agent_id == "":
+        _log_attempt("resolve", False, f"invalid agent_id: {body.get('agent_id')!r}")
+        return _challenge({"error": "invalid_agent_id",
+                           "detail": "agent_id must be an int or numeric string"})
 
     accepted = requirements["accepts"][0]
     try:
@@ -113,6 +132,18 @@ async def vet_agent_post(request: Request):
             if not v_ok:
                 return _challenge({"error": "payment_verification_failed",
                                    "detail": v_reason})
+
+            if agent_id is not None:
+                try:
+                    agent, reviews = await resolve_agent(agent_id)
+                    _log_attempt("resolve", True, f"resolved agent_id={agent_id}")
+                except ResolveError as e:
+                    _log_attempt("resolve", False, str(e))
+                    # Verified but not settled -- buyer isn't charged for a failed lookup.
+                    return _challenge({"error": "agent_not_found", "detail": str(e)})
+            else:
+                agent = body.get("agent", {}) or {}
+                reviews = body.get("reviews", {}) or {}
 
             report = await vet_agent(agent, reviews, XLAYER_RPC)
 
@@ -129,3 +160,25 @@ async def vet_agent_post(request: Request):
 
     _log_attempt("delivered", True, "report returned")
     return report.to_dict()
+
+
+@app.get("/sample")
+async def sample():
+    now = datetime.now(timezone.utc).timestamp()
+    stale = (now - _sample_cache["generated_at"]) > SAMPLE_TTL_SECONDS
+    if _sample_cache["report"] is None or stale:
+        try:
+            agent, reviews = await resolve_agent(SAMPLE_AGENT_ID)
+            report = await vet_agent(agent, reviews, XLAYER_RPC)
+        except ResolveError as e:
+            _log_attempt("sample", False, str(e))
+            if _sample_cache["report"] is not None:
+                return _sample_cache["report"]  # serve stale rather than fail
+            return JSONResponse(status_code=502, content={"error": "sample_unavailable",
+                                                           "detail": str(e)})
+        payload = report.to_dict()
+        payload["note"] = SAMPLE_NOTE
+        _sample_cache["report"] = payload
+        _sample_cache["generated_at"] = now
+        _log_attempt("sample", True, "refreshed")
+    return _sample_cache["report"]
