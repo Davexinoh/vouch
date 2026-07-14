@@ -6,6 +6,7 @@ import json as _json
 import os
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
@@ -15,7 +16,7 @@ from .vetting import vet_agent
 from . import x402
 from .resolver import resolve_agent, ResolveError
 
-app = FastAPI(title="Vouch", version="1.4.0")
+app = FastAPI(title="Vouch", version="1.5.0")
 
 XLAYER_RPC = os.environ.get("XLAYER_RPC", "")
 VET_PRICE = os.environ.get("VET_PRICE", "1000000")
@@ -24,11 +25,11 @@ SELF_URL = os.environ.get("SELF_URL", "https://vouch-4ib4.onrender.com")
 READY = {"vet_agent": True}
 ATTEMPTS: deque = deque(maxlen=20)
 
-SAMPLE_AGENT_ID = "4984"
-SAMPLE_TTL_SECONDS = 6 * 3600
+SAMPLE_DATA_PATH = Path(__file__).parent / "sample_data.json"
 SAMPLE_NOTE = ("This is Vouch's public self-audit. Paid reports run the same "
                "engine on any agent.")
-_sample_cache: dict = {"report": None, "generated_at": 0.0}
+AGENT_ID_COMING_SOON = ("pass full agent+reviews objects to vet immediately; "
+                        "agent_id resolution coming.")
 
 
 def _now_iso() -> str:
@@ -140,7 +141,8 @@ async def vet_agent_post(request: Request):
                 except ResolveError as e:
                     _log_attempt("resolve", False, str(e))
                     # Verified but not settled -- buyer isn't charged for a failed lookup.
-                    return _challenge({"error": "agent_not_found", "detail": str(e)})
+                    return _challenge({"error": "agent_not_found",
+                                       "detail": f"{e} — {AGENT_ID_COMING_SOON}"})
             else:
                 agent = body.get("agent", {}) or {}
                 reviews = body.get("reviews", {}) or {}
@@ -164,21 +166,21 @@ async def vet_agent_post(request: Request):
 
 @app.get("/sample")
 async def sample():
-    now = datetime.now(timezone.utc).timestamp()
-    stale = (now - _sample_cache["generated_at"]) > SAMPLE_TTL_SECONDS
-    if _sample_cache["report"] is None or stale:
-        try:
-            agent, reviews = await resolve_agent(SAMPLE_AGENT_ID)
-            report = await vet_agent(agent, reviews, XLAYER_RPC)
-        except ResolveError as e:
-            _log_attempt("sample", False, str(e))
-            if _sample_cache["report"] is not None:
-                return _sample_cache["report"]  # serve stale rather than fail
-            return JSONResponse(status_code=502, content={"error": "sample_unavailable",
-                                                           "detail": str(e)})
-        payload = report.to_dict()
-        payload["note"] = SAMPLE_NOTE
-        _sample_cache["report"] = payload
-        _sample_cache["generated_at"] = now
-        _log_attempt("sample", True, "refreshed")
-    return _sample_cache["report"]
+    try:
+        raw = _json.loads(SAMPLE_DATA_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        _log_attempt("sample", False, f"sample_data.json unreadable: {e}")
+        return JSONResponse(status_code=502, content={"error": "sample_unavailable",
+                                                       "detail": str(e)})
+
+    agent = raw.get("agent", {}) or {}
+    reviews = raw.get("reviews", {}) or {}
+    snapshot_at = raw.get("snapshot_at")
+
+    report = await vet_agent(agent, reviews, XLAYER_RPC)
+    _log_attempt("sample", True, f"vetted from snapshot {snapshot_at}")
+
+    payload = report.to_dict()
+    payload["snapshot_at"] = snapshot_at
+    payload["note"] = SAMPLE_NOTE
+    return payload
