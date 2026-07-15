@@ -8,6 +8,8 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+import asyncio
+import asyncio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -66,6 +68,28 @@ def _challenge(extra: dict | None = None) -> JSONResponse:
         },
     )
 
+
+
+KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_SECONDS", "300"))
+
+async def _self_ping():
+    """Hit our own /health every 5 min so Render free tier never sleeps."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            async with httpx.AsyncClient() as c:
+                await c.get(f"{SELF_URL}/health", timeout=10)
+        except Exception:
+            pass
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+
+@app.on_event("startup")
+async def _start_keepalive():
+    asyncio.create_task(_self_ping())
+
+
+KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_SECONDS", "300"))
 
 @app.get("/health")
 async def health():
