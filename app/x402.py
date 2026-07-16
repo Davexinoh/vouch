@@ -57,17 +57,22 @@ def payment_requirements(price_smallest_unit: str, resource_url: str,
                          description: str) -> dict:
     resource = {"url": resource_url, "description": description,
                 "mimeType": "application/json"}
-    accept = {
-        "scheme": "exact",
+    base = {
         "network": XLAYER_CAIP2,
         "amount": price_smallest_unit,
         "asset": USDT_XLAYER,
         "payTo": PAY_TO,
         "maxTimeoutSeconds": 60,
         "resource": resource,
+        # EIP-712 domain, shared by both schemes -- sessionCert is NOT here,
+        # it comes from the buyer's own payload (aggr_deferred only).
         "extra": {"name": TOKEN_NAME, "version": TOKEN_VERSION},
     }
-    return {"x402Version": 2, "resource": resource, "accepts": [accept]}
+    accepts = [
+        {"scheme": "exact", **base},          # plain EOA wallets
+        {"scheme": "aggr_deferred", **base},  # OKX agentic (AA) wallets
+    ]
+    return {"x402Version": 2, "resource": resource, "accepts": accepts}
 
 
 async def _call(client: httpx.AsyncClient, path: str, payload: dict) -> dict:

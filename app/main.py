@@ -112,6 +112,26 @@ async def vet_agent_probe():
     return _challenge()
 
 
+def _select_accepted(requirements: dict, payment_payload: dict) -> dict:
+    """Pick the accepts[] entry matching the buyer's payload, not always [0] --
+    exact (EOA) and aggr_deferred (OKX agentic/AA wallets) now both appear in
+    accepts, and verify/settle must be called with the entry the buyer signed
+    against."""
+    accepts = requirements["accepts"]
+    scheme = payment_payload.get("scheme")
+    if not scheme and isinstance(payment_payload.get("payload"), dict):
+        scheme = payment_payload["payload"].get("scheme")
+    if scheme:
+        match = next((a for a in accepts if a.get("scheme") == scheme), None)
+        if match:
+            return match
+    # No explicit scheme field in the payload -- infer from shape: aggr_deferred
+    # payments carry a sessionCert, exact payments carry a signature/authorization.
+    inner = payment_payload.get("payload") if isinstance(payment_payload.get("payload"), dict) else payment_payload
+    wanted = "aggr_deferred" if "sessionCert" in inner else "exact"
+    return next((a for a in accepts if a.get("scheme") == wanted), accepts[0])
+
+
 def _parse_agent_id(body: dict):
     """int or numeric-string 'agent_id' -> normalized str id, else None."""
     raw = body.get("agent_id")
@@ -148,7 +168,7 @@ async def vet_agent_post(request: Request):
         return _challenge({"error": "invalid_agent_id",
                            "detail": "agent_id must be an int or numeric string"})
 
-    accepted = requirements["accepts"][0]
+    accepted = _select_accepted(requirements, payload)
     try:
         async with httpx.AsyncClient() as client:
             verify = await x402.verify_payment(client, payload, accepted)
