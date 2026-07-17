@@ -28,6 +28,12 @@ RESOLVE_TIMEOUT = 15.0
 OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET = os.environ.get("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
+# Optional wallet JWT (from Agentic Wallet login). Required for priapi agent
+# identity routes — API-key alone is enough for x402 facilitator verify/settle
+# but returns code 10008 ("Invalid access token") on agent-list.
+OKX_ACCESS_TOKEN = os.environ.get("OKX_ACCESS_TOKEN", "") or os.environ.get(
+    "OKX_JWT", ""
+)
 
 
 class ResolveError(Exception):
@@ -47,13 +53,24 @@ def _sign(ts: str, method: str, path: str, body: str) -> str:
 
 def _headers(method: str, path: str, body: str) -> dict:
     ts = _ts()
-    return {
+    headers = {
         "Content-Type": "application/json",
         "OK-ACCESS-KEY": OKX_API_KEY,
         "OK-ACCESS-SIGN": _sign(ts, method, path, body),
         "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
         "OK-ACCESS-TIMESTAMP": ts,
     }
+    if OKX_ACCESS_TOKEN:
+        # Wallet session token — required by /priapi/v5/wallet/agentic/*
+        headers["Authorization"] = (
+            OKX_ACCESS_TOKEN
+            if OKX_ACCESS_TOKEN.lower().startswith("bearer ")
+            else f"Bearer {OKX_ACCESS_TOKEN}"
+        )
+        headers["OK-ACCESS-TOKEN"] = OKX_ACCESS_TOKEN.removeprefix("Bearer ").removeprefix(
+            "bearer "
+        )
+    return headers
 
 
 async def _get(client: httpx.AsyncClient, path: str) -> dict:
@@ -72,7 +89,15 @@ async def _get(client: httpx.AsyncClient, path: str) -> dict:
         raise ResolveError(f"{path} -> http {r.status_code}: {body}")
     code = str(body.get("code", "0"))
     if code not in ("0", ""):
-        raise ResolveError(f"{path} -> okx code {code}: {body.get('msg', '')}")
+        msg = body.get("msg", "")
+        hint = ""
+        if code == "10008" or "access token" in str(msg).lower():
+            hint = (
+                " — marketplace agent lookup needs a wallet session token "
+                "(set OKX_ACCESS_TOKEN on the ASP host), or pass full "
+                "agent+reviews objects in the POST body"
+            )
+        raise ResolveError(f"{path} -> okx code {code}: {msg}{hint}")
     return body
 
 

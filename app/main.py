@@ -211,10 +211,22 @@ async def vet_agent_post(request: Request):
                     agent, reviews = await resolve_agent(agent_id)
                     _log_attempt("resolve", True, f"resolved agent_id={agent_id}")
                 except ResolveError as e:
-                    _log_attempt("resolve", False, str(e))
-                    # Verified but not settled -- buyer isn't charged for a failed lookup.
-                    return _challenge({"error": "agent_not_found",
-                                       "detail": f"{e} — {AGENT_ID_COMING_SOON}"})
+                    # Fallback: buyer (or client agent) may already have the
+                    # marketplace snapshot — use it so a missing server JWT
+                    # does not brick paid reports. Still not settled yet.
+                    body_agent = body.get("agent") if isinstance(body.get("agent"), dict) else None
+                    if body_agent:
+                        agent = body_agent
+                        reviews = body.get("reviews") if isinstance(body.get("reviews"), dict) else {}
+                        _log_attempt(
+                            "resolve", True,
+                            f"agent_id={agent_id} via body snapshot after: {e}"
+                        )
+                    else:
+                        _log_attempt("resolve", False, str(e))
+                        # Verified but not settled -- buyer isn't charged for a failed lookup.
+                        return _challenge({"error": "agent_not_found",
+                                           "detail": f"{e} — {AGENT_ID_COMING_SOON}"})
             else:
                 agent = body.get("agent", {}) or {}
                 reviews = body.get("reviews", {}) or {}
