@@ -25,5 +25,34 @@ never touches the numbers.
 
 ## Payment
 
-x402 exact scheme on X Layer (eip155:196), settled via the OKX facilitator.
-Unpaid calls receive a 402 with payment requirements.
+x402 exact + aggr_deferred on X Layer (eip155:196), settled via the OKX
+facilitator. Unpaid calls receive a 402 with payment requirements.
+
+### Request body (paid POST)
+
+```json
+{ "agent_id": "6086" }
+```
+
+Server resolves marketplace identity when a wallet session is available.
+
+**Recommended client shape** (always works — use this from user agents so a
+missing server JWT cannot brick paid calls):
+
+```json
+{
+  "agent_id": "6086",
+  "agent": { "...get-agents snapshot..." },
+  "reviews": { "...feedback-list snapshot..." }
+}
+```
+
+If `agent_id` resolve fails (marketplace code 10008), Vouch falls back to the
+`agent` / `reviews` objects in the body and still settles after a successful
+report.
+
+### Env
+
+See `.env.example`. Facilitator needs `OKX_API_KEY` / `OKX_SECRET_KEY` /
+`OKX_PASSPHRASE`. Optional `OKX_ACCESS_TOKEN` for server-side agent-list.
+`GET /health` → `marketplace_resolve` shows whether agent_id-only resolve works.
