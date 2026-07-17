@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncio
-import asyncio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -89,8 +88,6 @@ async def _start_keepalive():
     asyncio.create_task(_self_ping())
 
 
-KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_SECONDS", "300"))
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "vouch", "ready": READY,
@@ -116,8 +113,30 @@ def _select_accepted(requirements: dict, payment_payload: dict) -> dict:
     """Pick the accepts[] entry matching the buyer's payload, not always [0] --
     exact (EOA) and aggr_deferred (OKX agentic/AA wallets) now both appear in
     accepts, and verify/settle must be called with the entry the buyer signed
-    against."""
+    against.
+
+    onchainos / x402 v2 puts scheme on paymentPayload.accepted.scheme (and for
+    aggr_deferred, sessionCert on accepted.extra) — not on the top-level payload.
+    Prefer the buyer's own accepted object when present so facilitator fields
+    match the signed authorization byte-for-byte.
+    """
     accepts = requirements["accepts"]
+    buyer_accepted = payment_payload.get("accepted")
+    if isinstance(buyer_accepted, dict) and buyer_accepted.get("scheme"):
+        scheme = buyer_accepted.get("scheme")
+        # Prefer seller's current entry of the same scheme (authoritative payTo/asset),
+        # but fall back to the buyer's accepted blob if the scheme is no longer offered.
+        match = next((a for a in accepts if a.get("scheme") == scheme), None)
+        if match:
+            # Overlay buyer-signed fields the facilitator checks against the signature
+            # (amount/asset/payTo/network/extra) when present — avoids regen drift.
+            merged = {**match, **{k: buyer_accepted[k] for k in
+                                  ("amount", "asset", "payTo", "network", "extra",
+                                   "maxTimeoutSeconds", "resource", "scheme")
+                                  if k in buyer_accepted}}
+            return merged
+        return buyer_accepted
+
     scheme = payment_payload.get("scheme")
     if not scheme and isinstance(payment_payload.get("payload"), dict):
         scheme = payment_payload["payload"].get("scheme")
@@ -125,10 +144,13 @@ def _select_accepted(requirements: dict, payment_payload: dict) -> dict:
         match = next((a for a in accepts if a.get("scheme") == scheme), None)
         if match:
             return match
-    # No explicit scheme field in the payload -- infer from shape: aggr_deferred
-    # payments carry a sessionCert, exact payments carry a signature/authorization.
-    inner = payment_payload.get("payload") if isinstance(payment_payload.get("payload"), dict) else payment_payload
-    wanted = "aggr_deferred" if "sessionCert" in inner else "exact"
+
+    # Infer from shape: sessionCert may live under accepted.extra (agentic) or
+    # under payload (some wallets).
+    accepted = buyer_accepted if isinstance(buyer_accepted, dict) else {}
+    extra = accepted.get("extra") if isinstance(accepted.get("extra"), dict) else {}
+    inner = payment_payload.get("payload") if isinstance(payment_payload.get("payload"), dict) else {}
+    wanted = "aggr_deferred" if ("sessionCert" in extra or "sessionCert" in inner) else "exact"
     return next((a for a in accepts if a.get("scheme") == wanted), accepts[0])
 
 
@@ -173,10 +195,16 @@ async def vet_agent_post(request: Request):
         async with httpx.AsyncClient() as client:
             verify = await x402.verify_payment(client, payload, accepted)
             v_ok, v_reason = x402.outcome(verify)
-            _log_attempt("verify", v_ok, v_reason)
+            # Surface raw facilitator body so /status shows real invalidReason
+            # instead of a generic "success not true".
+            _log_attempt(
+                "verify", v_ok,
+                v_reason if v_ok else f"{v_reason} | raw={_json.dumps(verify.get('body'), ensure_ascii=False)[:400]}"
+            )
             if not v_ok:
                 return _challenge({"error": "payment_verification_failed",
-                                   "detail": v_reason})
+                                   "detail": v_reason,
+                                   "facilitator": verify.get("body")})
 
             if agent_id is not None:
                 try:
@@ -195,10 +223,14 @@ async def vet_agent_post(request: Request):
 
             settle = await x402.settle_payment(client, payload, accepted)
             s_ok, s_reason = x402.outcome(settle)
-            _log_attempt("settle", s_ok, s_reason)
+            _log_attempt(
+                "settle", s_ok,
+                s_reason if s_ok else f"{s_reason} | raw={_json.dumps(settle.get('body'), ensure_ascii=False)[:400]}"
+            )
             if not s_ok:
                 return _challenge({"error": "settlement_failed",
-                                   "detail": s_reason})
+                                   "detail": s_reason,
+                                   "facilitator": settle.get("body")})
     except httpx.HTTPError as e:
         _log_attempt("facilitator", False, f"unreachable: {e}")
         return _challenge({"error": "facilitator_unavailable",

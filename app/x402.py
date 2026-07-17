@@ -59,13 +59,15 @@ def payment_requirements(price_smallest_unit: str, resource_url: str,
                 "mimeType": "application/json"}
     base = {
         "network": XLAYER_CAIP2,
-        "amount": price_smallest_unit,
+        "amount": str(price_smallest_unit),
+        "decimals": 6,
         "asset": USDT_XLAYER,
         "payTo": PAY_TO,
         "maxTimeoutSeconds": 60,
         "resource": resource,
         # EIP-712 domain, shared by both schemes -- sessionCert is NOT here,
         # it comes from the buyer's own payload (aggr_deferred only).
+        # Must match the on-chain USDT0 domain name (USD + U+20AE + 0).
         "extra": {"name": TOKEN_NAME, "version": TOKEN_VERSION},
     }
     accepts = [
@@ -76,9 +78,10 @@ def payment_requirements(price_smallest_unit: str, resource_url: str,
 
 
 async def _call(client: httpx.AsyncClient, path: str, payload: dict) -> dict:
-    body = json.dumps(payload)
+    # Compact JSON so the HMAC body matches the bytes on the wire exactly.
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     r = await client.post(OKX_BASE + path, headers=_headers("POST", path, body),
-                          content=body, timeout=30)
+                          content=body.encode("utf-8"), timeout=30)
     try:
         parsed = r.json()
     except Exception:
@@ -100,22 +103,33 @@ async def settle_payment(client, payment_payload, requirements):
 
 def outcome(resp: dict):
     body = resp.get("body", {})
+    http_status = resp.get("http_status")
     if not isinstance(body, dict):
-        return False, f"non-json (http {resp.get('http_status')})"
+        return False, f"non-json (http {http_status})"
+    code = str(body.get("code", ""))
+    msg = str(body.get("msg", "") or body.get("error_message", "") or "")
+    # Auth / permission failures often return code != "0" with empty data.
+    if code and code not in ("0", "None"):
+        return False, f"okx code {code}: {msg or 'auth or request rejected'}"
     data = body.get("data")
     if isinstance(data, list) and data:
         data = data[0]
     if isinstance(data, dict):
-        if data.get("success") is True:
+        if data.get("success") is True or data.get("isValid") is True:
             return True, ""
         reason = (data.get("invalidReason") or data.get("errorReason")
-                  or body.get("msg") or "")
-        return False, str(reason) or f"success not true (http {resp.get('http_status')})"
-    code = str(body.get("code", ""))
-    msg = str(body.get("msg", ""))
-    if code and code != "0":
-        return False, f"okx code {code}: {msg}"
-    return False, msg or f"unrecognized (http {resp.get('http_status')})"
+                  or data.get("message") or data.get("msg") or msg or "")
+        if reason:
+            return False, str(reason)
+        # Keep a short body dump so production /status is actionable.
+        try:
+            snippet = json.dumps(data, ensure_ascii=False)[:240]
+        except Exception:
+            snippet = str(data)[:240]
+        return False, f"success not true (http {http_status}) data={snippet}"
+    if msg:
+        return False, msg
+    return False, f"unrecognized (http {http_status}) body={str(body)[:240]}"
 
 
 def decode_x_payment(header_value: str) -> dict:
