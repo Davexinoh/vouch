@@ -90,8 +90,12 @@ async def _start_keepalive():
 
 @app.get("/health")
 async def health():
+    from .resolver import resolve_ready
+
+    resolve = await resolve_ready()
     return {"status": "ok", "service": "vouch", "ready": READY,
             "credentials_configured": x402.credentials_present(),
+            "marketplace_resolve": resolve,
             "fetched_at": _now_iso()}
 
 
