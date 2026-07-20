@@ -53,7 +53,7 @@ class RiskSignal:
 @dataclass
 class VetReport:
     agent_id: str
-    trust_score: int          # 0-100, computed from signals
+    trust_score: Optional[int]  # 0-100, or None when there was no real data to score
     signals: list[RiskSignal]
     summary: str              # LLM prose, wraps facts, invents nothing
     fetched_at: str

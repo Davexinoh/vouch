@@ -17,6 +17,18 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Minimum fields an agent object must carry to be a real vetting subject.
+# Without them the listing-meta signals fire on absent defaults (security
+# missing, zero sales, offline) and produce a score computed from nothing --
+# which is worse than no score. See _has_real_data / vet_agent.
+REQUIRED_AGENT_FIELDS = ("agentId", "ownerAddress", "createdAt")
+
+
+def _has_real_data(agent: dict) -> bool:
+    """True only if the agent object carries real identifying data to score."""
+    return all(agent.get(f) not in (None, "") for f in REQUIRED_AGENT_FIELDS)
+
+
 def analyze_listing_meta(agent: dict) -> list:
     """Signals from the identity record itself. All fields verified real."""
     signals = []
@@ -117,6 +129,19 @@ async def vet_agent(agent: dict, reviews_block: dict, rpc_url: str,
                 claim=f"Owner wallet appears on {len(others)} listings",
                 source_type="agent_id", source_ref=owner, fetched_at=_now_iso())],
         ))
+
+    if not _has_real_data(agent):
+        # Nothing real was scored -- every listing-meta signal fired on an
+        # absent default. Emit the (empty/degenerate) signals for transparency
+        # but withhold the number rather than report a fabricated score.
+        return VetReport(
+            agent_id=agent.get("agentId", "?"),
+            trust_score=None,
+            signals=signals,
+            summary="No trust score: agent object lacked the minimum data to "
+                    "vet (agentId, ownerAddress, createdAt). Nothing was scored.",
+            fetched_at=_now_iso(),
+        )
 
     score = compute_trust_score(signals)
     return VetReport(

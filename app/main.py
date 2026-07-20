@@ -13,7 +13,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .vetting import vet_agent
+from .vetting import vet_agent, _has_real_data, REQUIRED_AGENT_FIELDS
 from . import x402
 from .resolver import resolve_agent, ResolveError
 
@@ -47,7 +47,8 @@ def _log_attempt(stage: str, ok: bool, detail: str = "") -> None:
 def _requirements() -> dict:
     return x402.payment_requirements(
         VET_PRICE, f"{SELF_URL}/vet_agent",
-        "Vouch agent due-diligence report")
+        'Vouch agent due-diligence report. POST {"agent_id": "<id>"} or '
+        '{"agent": {...}, "reviews": {...}}')
 
 
 def _challenge(extra: dict | None = None) -> JSONResponse:
@@ -234,6 +235,21 @@ async def vet_agent_post(request: Request):
             else:
                 agent = body.get("agent", {}) or {}
                 reviews = body.get("reviews", {}) or {}
+                # Legacy path: no agent_id, so the buyer must supply a real agent
+                # object. Reject empty/stub bodies BEFORE settle -- same fail-safe
+                # as the agent_id-not-found path. A buyer was once charged for a
+                # report generated from an empty agent object; never again.
+                if not _has_real_data(agent):
+                    _log_attempt(
+                        "validate", False,
+                        f"agent object missing required fields "
+                        f"{REQUIRED_AGENT_FIELDS}; not settling")
+                    return _challenge({
+                        "error": "invalid_request",
+                        "detail": "body must include either agent_id or a full "
+                                  "agent object with agentId, ownerAddress, "
+                                  "createdAt (plus reviews if available). See "
+                                  "GET /sample for the report format."})
 
             report = await vet_agent(agent, reviews, XLAYER_RPC)
 
