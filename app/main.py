@@ -199,12 +199,14 @@ async def vet_agent_post(request: Request):
     try:
         async with httpx.AsyncClient() as client:
             verify = await x402.verify_payment(client, payload, accepted)
-            v_ok, v_reason = x402.outcome(verify)
+            v_ok, v_reason, v_payer = x402.outcome(verify)
+            payer = v_payer  # captured at verify; settle may confirm/override
             # Surface raw facilitator body so /status shows real invalidReason
             # instead of a generic "success not true".
             _log_attempt(
                 "verify", v_ok,
-                v_reason if v_ok else f"{v_reason} | raw={_json.dumps(verify.get('body'), ensure_ascii=False)[:400]}"
+                (f"payer={v_payer or '?'} | {v_reason}".strip(" |") if v_ok
+                 else f"payer={v_payer or '?'} | {v_reason} | raw={_json.dumps(verify.get('body'), ensure_ascii=False)[:400]}")
             )
             if not v_ok:
                 return _challenge({"error": "payment_verification_failed",
@@ -254,10 +256,14 @@ async def vet_agent_post(request: Request):
             report = await vet_agent(agent, reviews, XLAYER_RPC)
 
             settle = await x402.settle_payment(client, payload, accepted)
-            s_ok, s_reason = x402.outcome(settle)
+            s_ok, s_reason, s_payer = x402.outcome(settle)
+            payer = s_payer or payer  # prefer settle's payer, keep verify's if absent
             _log_attempt(
                 "settle", s_ok,
-                s_reason if s_ok else f"{s_reason} | raw={_json.dumps(settle.get('body'), ensure_ascii=False)[:400]}"
+                (f"payer={payer or '?'} settled {accepted.get('amount','?')} "
+                 f"{accepted.get('asset','?')} scheme={accepted.get('scheme','?')}"
+                 if s_ok
+                 else f"payer={payer or '?'} | {s_reason} | raw={_json.dumps(settle.get('body'), ensure_ascii=False)[:400]}")
             )
             if not s_ok:
                 return _challenge({"error": "settlement_failed",
@@ -268,7 +274,7 @@ async def vet_agent_post(request: Request):
         return _challenge({"error": "facilitator_unavailable",
                            "detail": str(e)})
 
-    _log_attempt("delivered", True, "report returned")
+    _log_attempt("delivered", True, f"report returned to payer={payer or '?'}")
     return report.to_dict()
 
 

@@ -101,35 +101,68 @@ async def settle_payment(client, payment_payload, requirements):
                         "paymentRequirements": requirements})
 
 
+def _extract_payer(*objs) -> str:
+    """Pull the payer address out of a facilitator body / data / payload blob.
+
+    The x402 facilitator has used a few names across versions and schemes
+    (exact vs aggr_deferred), so check the common ones in priority order and
+    return the first non-empty address-looking value. Returns "" if none found
+    -- payer capture is best-effort and must never break settle handling.
+    """
+    keys = ("payer", "payerAddress", "payer_address", "from", "fromAddress",
+            "sender", "senderAddress", "payFrom", "payerAddr", "account")
+    for o in objs:
+        if not isinstance(o, dict):
+            continue
+        for k in keys:
+            v = o.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # aggr_deferred nests signer/payer under authorization / accepted.extra
+        for nested in ("authorization", "accepted", "extra", "payload"):
+            n = o.get(nested)
+            if isinstance(n, dict):
+                got = _extract_payer(n)
+                if got:
+                    return got
+    return ""
+
+
 def outcome(resp: dict):
+    """Return (ok: bool, reason: str, payer: str).
+
+    payer is the buyer's address parsed from the facilitator response when
+    present ("" otherwise) so every verify/settle can be logged with who paid.
+    """
     body = resp.get("body", {})
     http_status = resp.get("http_status")
     if not isinstance(body, dict):
-        return False, f"non-json (http {http_status})"
+        return False, f"non-json (http {http_status})", ""
     code = str(body.get("code", ""))
     msg = str(body.get("msg", "") or body.get("error_message", "") or "")
     # Auth / permission failures often return code != "0" with empty data.
     if code and code not in ("0", "None"):
-        return False, f"okx code {code}: {msg or 'auth or request rejected'}"
+        return False, f"okx code {code}: {msg or 'auth or request rejected'}", ""
     data = body.get("data")
     if isinstance(data, list) and data:
         data = data[0]
+    payer = _extract_payer(data, body)
     if isinstance(data, dict):
         if data.get("success") is True or data.get("isValid") is True:
-            return True, ""
+            return True, "", payer
         reason = (data.get("invalidReason") or data.get("errorReason")
                   or data.get("message") or data.get("msg") or msg or "")
         if reason:
-            return False, str(reason)
+            return False, str(reason), payer
         # Keep a short body dump so production /status is actionable.
         try:
             snippet = json.dumps(data, ensure_ascii=False)[:240]
         except Exception:
             snippet = str(data)[:240]
-        return False, f"success not true (http {http_status}) data={snippet}"
+        return False, f"success not true (http {http_status}) data={snippet}", payer
     if msg:
-        return False, msg
-    return False, f"unrecognized (http {http_status}) body={str(body)[:240]}"
+        return False, msg, payer
+    return False, f"unrecognized (http {http_status}) body={str(body)[:240]}", payer
 
 
 def decode_x_payment(header_value: str) -> dict:
