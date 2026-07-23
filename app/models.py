@@ -18,7 +18,7 @@ class Severity(str, Enum):
 class Evidence:
     """One verifiable fact. If it has no source, it does not go in a report."""
     claim: str
-    source_type: str          # "tx_hash" | "block" | "repo" | "agent_id" | "timestamp"
+    source_type: str          # "tx_hash" | "block" | "repo" | "agent_id" | "timestamp" | "gap" | "live_probe" | "rpc"
     source_ref: str           # the actual hash, url, block number, id
     fetched_at: str           # ISO string, never datetime.now() inline
 
@@ -33,20 +33,34 @@ class Evidence:
 
 @dataclass
 class RiskSignal:
-    """A deterministic flag derived from evidence. Score comes from these, not the LLM."""
+    """A deterministic flag derived from evidence. Score comes from these, not the LLM.
+
+    `evaluated` is critical for honesty:
+    - evaluated=True, triggered=False  → clean pass (check ran, no risk found)
+    - evaluated=True, triggered=True   → risk found
+    - evaluated=False                  → not checked (missing data / capability gap)
+      Must NEVER look like a clean pass; score ignores it.
+    """
     name: str
     triggered: bool
-    weight: int               # contribution to risk score when triggered
+    weight: int               # contribution to risk score when triggered AND evaluated
     severity: Severity
     evidence: list[Evidence] = field(default_factory=list)
+    evaluated: bool = True
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
-            "triggered": self.triggered,
-            "weight": self.weight,
+            "triggered": self.triggered if self.evaluated else False,
+            "evaluated": self.evaluated,
+            "weight": self.weight if self.evaluated else 0,
             "severity": self.severity.value,
             "evidence": [e.to_dict() for e in self.evidence],
+            "status": (
+                "triggered" if self.evaluated and self.triggered
+                else "clean" if self.evaluated
+                else "not_evaluated"
+            ),
         }
 
 
@@ -55,7 +69,7 @@ class VetReport:
     agent_id: str
     trust_score: Optional[int]  # 0-100, or None when there was no real data to score
     signals: list[RiskSignal]
-    summary: str              # LLM prose, wraps facts, invents nothing
+    summary: str              # prose wrapping facts; invents nothing
     fetched_at: str
 
     def to_dict(self) -> dict:

@@ -1,7 +1,7 @@
 """Evidence collectors. Each returns real, sourced facts or an explicit gap.
 
 Never fabricate a value to fill a field. If data is missing, the signal
-reports missing, and the report says so. That honesty is the product.
+is not_evaluated — never a silent clean pass.
 """
 from __future__ import annotations
 
@@ -20,68 +20,122 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 # X Layer wallet forensics
 # ---------------------------------------------------------------------------
-# X Layer is EVM. Use its RPC or explorer API. Wire the real endpoint in config.
-# Below is the shape. Fill XLAYER_RPC and the explorer key on day 1.
 
 async def fetch_wallet_facts(client: httpx.AsyncClient, wallet: str, rpc_url: str) -> dict:
-    """Return wallet age, tx count, first-seen block. Real RPC calls.
+    """Return wallet tx count and optional first-seen. Real RPC calls only.
 
-    Returns a dict of raw facts. Signals are derived in analyze_wallet.
+    first_seen_block stays None until an explorer API is wired — do not invent it.
     """
-    facts = {"wallet": wallet, "fetched_at": _now_iso()}
+    facts = {"wallet": wallet, "fetched_at": _now_iso(), "first_seen_block": None,
+             "first_seen_ts": None}
 
-    # eth_getTransactionCount for nonce (activity proxy)
     payload = {
         "jsonrpc": "2.0",
         "method": "eth_getTransactionCount",
         "params": [wallet, "latest"],
         "id": 1,
     }
-    r = await client.post(rpc_url, json=payload, timeout=15)
-    r.raise_for_status()
-    nonce_hex = r.json().get("result", "0x0")
-    facts["tx_count"] = int(nonce_hex, 16)
-
-    # First-seen block requires an explorer API (e.g. OKLink for X Layer).
-    # Placeholder key: wire OKLINK_KEY. Do not fake first_seen_block.
-    facts["first_seen_block"] = None  # filled by explorer call once wired
-
+    try:
+        r = await client.post(rpc_url, json=payload, timeout=15)
+        r.raise_for_status()
+        nonce_hex = r.json().get("result", "0x0")
+        facts["tx_count"] = int(nonce_hex, 16)
+        facts["rpc_ok"] = True
+    except Exception as e:
+        facts["tx_count"] = None
+        facts["rpc_ok"] = False
+        facts["rpc_error"] = str(e)[:180]
     return facts
 
 
 def analyze_wallet(facts: dict) -> list:
-    """Turn wallet facts into signals with evidence. No invented data."""
+    """Turn wallet facts into signals. Gaps are not_evaluated, never clean."""
     signals = []
+    fetched = facts["fetched_at"]
+    wallet = facts["wallet"]
 
-    tx_count = facts.get("tx_count", 0)
-    zero_payouts = tx_count == 0
-    signals.append(build_signal(
-        name="zero_prior_payouts",
-        triggered=zero_payouts,
-        severity=Severity.medium,
-        evidence=[Evidence(
-            claim=f"Wallet has {tx_count} outbound transactions",
-            source_type="rpc",
-            source_ref=facts["wallet"],
-            fetched_at=facts["fetched_at"],
-        )],
-    ))
+    if not facts.get("rpc_ok", True) or facts.get("tx_count") is None:
+        signals.append(build_signal(
+            name="zero_prior_payouts",
+            triggered=False,
+            severity=Severity.medium,
+            evaluated=False,
+            evidence=[Evidence(
+                claim=f"Outbound activity not checked: RPC error "
+                      f"({facts.get('rpc_error', 'unknown')})",
+                source_type="gap",
+                source_ref=wallet,
+                fetched_at=fetched,
+            )],
+        ))
+    else:
+        tx_count = facts.get("tx_count", 0)
+        zero_payouts = tx_count == 0
+        signals.append(build_signal(
+            name="zero_prior_payouts",
+            triggered=zero_payouts,
+            severity=Severity.medium,
+            evidence=[Evidence(
+                claim=f"Wallet has {tx_count} outbound transactions (eth_getTransactionCount)",
+                source_type="rpc",
+                source_ref=wallet,
+                fetched_at=fetched,
+            )],
+        ))
 
-    # wallet_age_under_7d needs first_seen_block. If unavailable, report gap.
+    # wallet_age_under_7d requires first-seen time from an explorer.
+    # Until that is wired, emit NOT EVALUATED — never a clean pass.
     first_block = facts.get("first_seen_block")
-    if first_block is None:
-        # Do not trigger the signal on missing data. Report the gap instead.
+    first_ts = facts.get("first_seen_ts")
+    if first_block is None and first_ts is None:
         signals.append(build_signal(
             name="wallet_age_under_7d",
             triggered=False,
-            severity=Severity.info,
+            severity=Severity.low,
+            evaluated=False,
             evidence=[Evidence(
-                claim="Wallet age not resolved (explorer API not wired yet)",
+                claim=(
+                    "Wallet age not checked: no X Layer explorer first-seen API "
+                    "configured (first_seen_block unavailable). Not a clean pass."
+                ),
                 source_type="gap",
-                source_ref=facts["wallet"],
-                fetched_at=facts["fetched_at"],
+                source_ref=wallet,
+                fetched_at=fetched,
             )],
         ))
+    else:
+        # If explorer ever wires first_ts (unix s or ms), evaluate age.
+        try:
+            ts = float(first_ts)
+            if ts > 1e12:
+                ts /= 1000.0
+            age_days = (datetime.now(timezone.utc).timestamp() - ts) / 86_400
+            young = age_days < 7
+            signals.append(build_signal(
+                name="wallet_age_under_7d",
+                triggered=young,
+                severity=Severity.low,
+                evidence=[Evidence(
+                    claim=f"Wallet first-seen ~{age_days:.1f} days ago "
+                          f"(block={first_block})",
+                    source_type="block",
+                    source_ref=str(first_block or first_ts),
+                    fetched_at=fetched,
+                )],
+            ))
+        except Exception:
+            signals.append(build_signal(
+                name="wallet_age_under_7d",
+                triggered=False,
+                severity=Severity.low,
+                evaluated=False,
+                evidence=[Evidence(
+                    claim="Wallet age not checked: first_seen timestamp unparseable",
+                    source_type="gap",
+                    source_ref=wallet,
+                    fetched_at=fetched,
+                )],
+            ))
     return signals
 
 
@@ -93,7 +147,6 @@ async def fetch_repo_facts(client: httpx.AsyncClient, repo_url: str) -> dict:
     """Check repo exists, is fork, last commit date. Real GitHub API."""
     facts = {"repo_url": repo_url, "fetched_at": _now_iso(), "exists": False}
 
-    # Parse owner/name from url
     parts = repo_url.rstrip("/").split("/")
     if len(parts) < 2:
         return facts
@@ -102,7 +155,7 @@ async def fetch_repo_facts(client: httpx.AsyncClient, repo_url: str) -> dict:
     api = f"https://api.github.com/repos/{owner}/{name}"
     r = await client.get(api, timeout=15)
     if r.status_code == 404:
-        return facts  # exists stays False
+        return facts
     r.raise_for_status()
     data = r.json()
     facts["exists"] = True

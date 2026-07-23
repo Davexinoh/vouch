@@ -1,54 +1,64 @@
 """Deterministic scoring. The LLM never touches these numbers.
 
-Signals rebuilt against the REAL OKX.AI agent schema (verified 2026-07-10
-from live agent get-agents / feedback-list output). Every signal maps to a
-field that actually exists. Same inputs, same score, every time.
+Only signals that a collector actually emits belong in SIGNAL_WEIGHTS.
+Same inputs, same score, every time.
 """
 from __future__ import annotations
 
 from .models import RiskSignal, Severity
 
-
-# Signal weights. Verified-feedable signals only.
+# Signals that run in production collectors (count = 11).
+# Removed: owner_wallet_young (alias of wallet_age_under_7d),
+#          unverifiable_claim (no collector).
 SIGNAL_WEIGHTS = {
-    # Identity / listing signals (from agent get-agents)
-    "listing_age_under_7d": 15,        # createdAt
-    "security_rate_missing": 10,       # securityRate == ""
-    "offline_or_stale": 15,            # onlineStatus / lastOnlineTime null or old
-    "zero_sales": 10,                  # soldCount == 0
+    # Identity / listing (analyze_listing_meta)
+    "listing_age_under_7d": 15,
+    "security_rate_missing": 10,
+    "offline_or_stale": 15,
+    "zero_sales": 10,
 
-    # Wallet forensics (agentWalletAddress, ownerAddress, communicationAddress)
-    "owner_wallet_young": 15,          # first activity < 7d on X Layer
-    "wallet_reused_across_listings": 25,  # same ownerAddress on multiple agents
+    # Wallet forensics (analyze_wallet + known_owner_listings)
+    "zero_prior_payouts": 15,            # RPC nonce == 0
+    "wallet_age_under_7d": 15,           # needs first_seen; may be not_evaluated
+    "wallet_reused_across_listings": 25,
 
-    # Review forensics (from feedback-list, reviewer addresses are public)
-    "self_review_detected": 30,        # reviewerAddress == ownerAddress
-    "sybil_review_pattern": 25,        # reviewer wallets funded by owner / same-day cluster
-    "review_data_inconsistent": 15,    # distribution vs list vs totalScore mismatch
+    # Review forensics
+    "self_review_detected": 30,
+    # Internal id; public claims say "coordinated review timing/burst"
+    "sybil_review_pattern": 25,
+    "review_data_inconsistent": 15,
 
-    # Endpoint probing (services[].endpoint)
-    "endpoint_dead": 25,               # no valid x402 402 challenge response
-    "endpoint_wrong_status": 15,       # responds but not per x402 spec (e.g. 405)
-
-    # Description claims
-    "unverifiable_claim": 10,          # claimed integration/URL that does not resolve
+    # Endpoint probing (GET then POST)
+    "endpoint_dead": 25,                 # neither method responds
+    "endpoint_wrong_status": 15,         # responses but no valid 200/402
 }
 
+# Public count advertised in docs/product copy
+ACTIVE_SIGNAL_COUNT = len(SIGNAL_WEIGHTS)
 
-def build_signal(name: str, triggered: bool, severity: Severity, evidence: list) -> RiskSignal:
-    weight = SIGNAL_WEIGHTS.get(name, 0)
+
+def build_signal(
+    name: str,
+    triggered: bool,
+    severity: Severity,
+    evidence: list,
+    *,
+    evaluated: bool = True,
+) -> RiskSignal:
+    weight = SIGNAL_WEIGHTS.get(name, 0) if evaluated else 0
     return RiskSignal(
         name=name,
-        triggered=triggered,
+        triggered=bool(triggered) if evaluated else False,
         weight=weight,
         severity=severity,
         evidence=evidence,
+        evaluated=evaluated,
     )
 
 
 def compute_trust_score(signals: list[RiskSignal]) -> int:
-    """0 = maximum risk, 100 = clean. Pure function of triggered signals."""
-    penalty = sum(s.weight for s in signals if s.triggered)
+    """0 = maximum risk, 100 = clean. Only evaluated+triggered signals penalize."""
+    penalty = sum(s.weight for s in signals if s.evaluated and s.triggered)
     return max(0, 100 - penalty)
 
 

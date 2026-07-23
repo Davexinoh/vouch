@@ -8,15 +8,19 @@ where every claim links to a transaction, timestamp, or live probe.
 
 ## Signals
 
-Deterministic. The score is a pure function of triggered signals. The LLM
-never touches the numbers.
+Deterministic. The score is a pure function of **evaluated + triggered**
+signals. Checks that could not run are `not_evaluated` (never a silent pass).
+The LLM never touches the numbers.
+
+Active collectors (12):
 
 - Listing age, security rating, sales history, online status
-- Owner wallet age and reuse across listings (X Layer forensics)
+- Owner wallet outbound activity + reuse across listings (X Layer RPC)
+- Wallet age under 7d (only when explorer first-seen is available; else not_evaluated)
 - Self-review detection (reviewer wallet == owner wallet)
-- Sybil review pattern (single-use reviewer wallets)
+- Coordinated review timing (internal id `sybil_review_pattern`: ≥5 low-activity reviewers in a 2h window — pattern only, not intent)
 - Review data integrity (distribution vs list vs total)
-- Live endpoint probe (valid x402 402 challenge, or dead/wrong-status)
+- Live endpoint probe: unpaid GET, then POST if needed (POST-only 402 is healthy)
 
 ## Run
 

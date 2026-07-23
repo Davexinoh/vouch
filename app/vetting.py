@@ -102,12 +102,24 @@ async def vet_agent(agent: dict, reviews_block: dict, rpc_url: str,
         total = reviews_block.get("total", 0) or 0
         signals += analyze_reviews(owner, reviews, dist, total)
 
-        reviewer_addrs = [r.get("reviewerAddress", "") for r in reviews
-                          if r.get("reviewerAddress")]
-        if rpc_url and reviewer_addrs:
-            signals += await analyze_review_funding(client, owner, reviewer_addrs, rpc_url)
+        if rpc_url and reviews:
+            signals += await analyze_review_funding(client, owner, reviews, rpc_url)
+        elif reviews:
+            # RPC missing — do not pretend coordinated-timing was checked
+            signals.append(build_signal(
+                name="sybil_review_pattern",
+                triggered=False,
+                severity=Severity.high,
+                evaluated=False,
+                evidence=[Evidence(
+                    claim="Coordinated review timing not checked: no RPC URL configured",
+                    source_type="gap",
+                    source_ref=owner or "unknown",
+                    fetched_at=_now_iso(),
+                )],
+            ))
 
-        # 4. endpoint probe (first service endpoint)
+        # 4. endpoint probe (first service endpoint) — GET then POST
         services = agent.get("services", []) or []
         endpoint = None
         for s in services:
@@ -129,11 +141,21 @@ async def vet_agent(agent: dict, reviews_block: dict, rpc_url: str,
                 claim=f"Owner wallet appears on {len(others)} listings",
                 source_type="agent_id", source_ref=owner, fetched_at=_now_iso())],
         ))
+    elif owner and known_owner_listings is None:
+        signals.append(build_signal(
+            name="wallet_reused_across_listings",
+            triggered=False,
+            severity=Severity.high,
+            evaluated=False,
+            evidence=[Evidence(
+                claim="Wallet reuse not checked: no cross-listing owner map provided",
+                source_type="gap",
+                source_ref=owner,
+                fetched_at=_now_iso(),
+            )],
+        ))
 
     if not _has_real_data(agent):
-        # Nothing real was scored -- every listing-meta signal fired on an
-        # absent default. Emit the (empty/degenerate) signals for transparency
-        # but withhold the number rather than report a fabricated score.
         return VetReport(
             agent_id=agent.get("agentId", "?"),
             trust_score=None,
@@ -144,12 +166,15 @@ async def vet_agent(agent: dict, reviews_block: dict, rpc_url: str,
         )
 
     score = compute_trust_score(signals)
+    n_trig = sum(1 for s in signals if s.evaluated and s.triggered)
+    n_skip = sum(1 for s in signals if not s.evaluated)
+    skip_note = f" {n_skip} signal(s) not evaluated." if n_skip else ""
     return VetReport(
         agent_id=agent.get("agentId", "?"),
         trust_score=score,
         signals=signals,
         summary=f"{score_band(score)} ({score}/100). "
-                f"{sum(1 for s in signals if s.triggered)} risk signal(s) triggered. "
+                f"{n_trig} risk signal(s) triggered.{skip_note} "
                 f"Every finding below links to a source.",
         fetched_at=_now_iso(),
     )
