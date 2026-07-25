@@ -1,4 +1,4 @@
-﻿"""Vouch API — the A2MCP service. Live on X Layer mainnet."""
+"""Vouch API — the A2MCP service. Live on X Layer mainnet."""
 from __future__ import annotations
 
 import base64 as _b64
@@ -17,7 +17,7 @@ from .vetting import vet_agent, _has_real_data, REQUIRED_AGENT_FIELDS
 from . import x402
 from .resolver import resolve_agent, ResolveError
 
-app = FastAPI(title="Vouch", version="1.5.0")
+app = FastAPI(title="Vouch", version="1.6.0")
 
 XLAYER_RPC = os.environ.get("XLAYER_RPC", "")
 VET_PRICE = os.environ.get("VET_PRICE", "1000000")
@@ -29,8 +29,9 @@ ATTEMPTS: deque = deque(maxlen=20)
 SAMPLE_DATA_PATH = Path(__file__).parent / "sample_data.json"
 SAMPLE_NOTE = ("This is Vouch's public self-audit. Paid reports run the same "
                "engine on any agent.")
-AGENT_ID_COMING_SOON = ("pass full agent+reviews objects to vet immediately; "
-                        "agent_id resolution coming.")
+AGENT_ID_NOTE = ("agent_id resolution requires marketplace read access not yet "
+                  "wired up. Pass a full agent+reviews object instead — see "
+                  "GET /sample for the exact shape.")
 
 
 def _now_iso() -> str:
@@ -52,6 +53,11 @@ def _requirements() -> dict:
 
 
 def _challenge(extra: dict | None = None) -> JSONResponse:
+    """A real payment-required response. Use ONLY when the buyer has not yet
+    provided valid payment, or the payment itself failed verification/settlement.
+    Never use this for business-logic errors after payment succeeded -- a
+    buyer whose payment verified but whose request was bad should get a plain
+    error, not a second payment demand that looks identical to the first."""
     content = _requirements()
     header_payload = _b64.b64encode(
         _json.dumps(content, separators=(",", ":")).encode()
@@ -68,6 +74,16 @@ def _challenge(extra: dict | None = None) -> JSONResponse:
         },
     )
 
+
+def _error(status_code: int, error: str, detail: str) -> JSONResponse:
+    """A business-logic error response. Used for anything that is NOT a
+    payment problem -- bad/missing agent_id, agent not found, invalid input.
+    No payment envelope, no PAYMENT-REQUIRED header. This is what fixes the
+    'buyer paid, then got a second 402' confusion: once we know the request
+    is bad on its own merits, we say so plainly instead of re-issuing payment
+    terms that make it look like they still owe money."""
+    return JSONResponse(status_code=status_code,
+                         content={"error": error, "detail": detail})
 
 
 KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_SECONDS", "300"))
@@ -121,7 +137,7 @@ def _select_accepted(requirements: dict, payment_payload: dict) -> dict:
     against.
 
     onchainos / x402 v2 puts scheme on paymentPayload.accepted.scheme (and for
-    aggr_deferred, sessionCert on accepted.extra) — not on the top-level payload.
+    aggr_deferred, sessionCert on accepted.extra) -- not on the top-level payload.
     Prefer the buyer's own accepted object when present so facilitator fields
     match the signed authorization byte-for-byte.
     """
@@ -129,12 +145,8 @@ def _select_accepted(requirements: dict, payment_payload: dict) -> dict:
     buyer_accepted = payment_payload.get("accepted")
     if isinstance(buyer_accepted, dict) and buyer_accepted.get("scheme"):
         scheme = buyer_accepted.get("scheme")
-        # Prefer seller's current entry of the same scheme (authoritative payTo/asset),
-        # but fall back to the buyer's accepted blob if the scheme is no longer offered.
         match = next((a for a in accepts if a.get("scheme") == scheme), None)
         if match:
-            # Overlay buyer-signed fields the facilitator checks against the signature
-            # (amount/asset/payTo/network/extra) when present — avoids regen drift.
             merged = {**match, **{k: buyer_accepted[k] for k in
                                   ("amount", "asset", "payTo", "network", "extra",
                                    "maxTimeoutSeconds", "resource", "scheme")
@@ -150,8 +162,6 @@ def _select_accepted(requirements: dict, payment_payload: dict) -> dict:
         if match:
             return match
 
-    # Infer from shape: sessionCert may live under accepted.extra (agentic) or
-    # under payload (some wallets).
     accepted = buyer_accepted if isinstance(buyer_accepted, dict) else {}
     extra = accepted.get("extra") if isinstance(accepted.get("extra"), dict) else {}
     inner = payment_payload.get("payload") if isinstance(payment_payload.get("payload"), dict) else {}
@@ -191,36 +201,39 @@ async def vet_agent_post(request: Request):
         body = {}
     agent_id = _parse_agent_id(body)
     if agent_id == "":
+        # Malformed agent_id is a business error, not a payment problem --
+        # the buyer already attached payment. Say so plainly, no 402.
         _log_attempt("resolve", False, f"invalid agent_id: {body.get('agent_id')!r}")
-        return _challenge({"error": "invalid_agent_id",
-                           "detail": "agent_id must be an int or numeric string"})
+        return _error(400, "invalid_agent_id",
+                     "agent_id must be an int or numeric string")
 
     accepted = _select_accepted(requirements, payload)
     try:
         async with httpx.AsyncClient() as client:
             verify = await x402.verify_payment(client, payload, accepted)
             v_ok, v_reason, v_payer = x402.outcome(verify)
-            payer = v_payer  # captured at verify; settle may confirm/override
-            # Surface raw facilitator body so /status shows real invalidReason
-            # instead of a generic "success not true".
+            payer = v_payer
             _log_attempt(
                 "verify", v_ok,
                 (f"payer={v_payer or '?'} | {v_reason}".strip(" |") if v_ok
                  else f"payer={v_payer or '?'} | {v_reason} | raw={_json.dumps(verify.get('body'), ensure_ascii=False)[:400]}")
             )
             if not v_ok:
+                # This IS a real payment problem -- 402 is correct here.
                 return _challenge({"error": "payment_verification_failed",
                                    "detail": v_reason,
                                    "facilitator": verify.get("body")})
 
+            # From here on, payment is VERIFIED. Any failure below is a
+            # business-logic problem, never a payment problem -- so none of
+            # these paths may return _challenge()/402 again. We may still
+            # choose not to settle (buyer isn't charged), but the HTTP
+            # response must not look like "please pay."
             if agent_id is not None:
                 try:
                     agent, reviews = await resolve_agent(agent_id)
                     _log_attempt("resolve", True, f"resolved agent_id={agent_id}")
                 except ResolveError as e:
-                    # Fallback: buyer (or client agent) may already have the
-                    # marketplace snapshot — use it so a missing server JWT
-                    # does not brick paid reports. Still not settled yet.
                     body_agent = body.get("agent") if isinstance(body.get("agent"), dict) else None
                     if body_agent:
                         agent = body_agent
@@ -230,34 +243,33 @@ async def vet_agent_post(request: Request):
                             f"agent_id={agent_id} via body snapshot after: {e}"
                         )
                     else:
-                        _log_attempt("resolve", False, str(e))
-                        # Verified but not settled -- buyer isn't charged for a failed lookup.
-                        return _challenge({"error": "agent_not_found",
-                                           "detail": f"{e} — {AGENT_ID_COMING_SOON}"})
+                        _log_attempt("resolve", False,
+                                     f"payer={payer or '?'} | not settled | {e}")
+                        # Verified but NOT settled -- buyer isn't charged.
+                        # 404, not 402: the request was fine, the lookup failed.
+                        return _error(404, "agent_not_found",
+                                     f"{e} — {AGENT_ID_NOTE}")
             else:
                 agent = body.get("agent", {}) or {}
                 reviews = body.get("reviews", {}) or {}
-                # Legacy path: no agent_id, so the buyer must supply a real agent
-                # object. Reject empty/stub bodies BEFORE settle -- same fail-safe
-                # as the agent_id-not-found path. A buyer was once charged for a
-                # report generated from an empty agent object; never again.
                 if not _has_real_data(agent):
                     _log_attempt(
                         "validate", False,
-                        f"agent object missing required fields "
-                        f"{REQUIRED_AGENT_FIELDS}; not settling")
-                    return _challenge({
-                        "error": "invalid_request",
-                        "detail": "body must include either agent_id or a full "
-                                  "agent object with agentId, ownerAddress, "
-                                  "createdAt (plus reviews if available). See "
-                                  "GET /sample for the report format."})
+                        f"payer={payer or '?'} | not settled | agent object "
+                        f"missing required fields {REQUIRED_AGENT_FIELDS}")
+                    # Verified but NOT settled -- buyer isn't charged.
+                    # 400, not 402: the payment was fine, the input was bad.
+                    return _error(400, "invalid_request",
+                                 "body must include either agent_id or a full "
+                                 "agent object with agentId, ownerAddress, "
+                                 "createdAt (plus reviews if available). See "
+                                 "GET /sample for the report format.")
 
             report = await vet_agent(agent, reviews, XLAYER_RPC)
 
             settle = await x402.settle_payment(client, payload, accepted)
             s_ok, s_reason, s_payer = x402.outcome(settle)
-            payer = s_payer or payer  # prefer settle's payer, keep verify's if absent
+            payer = s_payer or payer
             _log_attempt(
                 "settle", s_ok,
                 (f"payer={payer or '?'} settled {accepted.get('amount','?')} "
@@ -266,6 +278,7 @@ async def vet_agent_post(request: Request):
                  else f"payer={payer or '?'} | {s_reason} | raw={_json.dumps(settle.get('body'), ensure_ascii=False)[:400]}")
             )
             if not s_ok:
+                # Settlement failing IS a payment problem -- 402 is correct.
                 return _challenge({"error": "settlement_failed",
                                    "detail": s_reason,
                                    "facilitator": settle.get("body")})
