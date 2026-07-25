@@ -34,6 +34,42 @@ PAYER_ADDR = "0xc385e2df2aa27a3fbe809e0faf7c5c357b716c63"
 # Use the REAL outcome() so payer extraction is exercised end to end.
 from app.x402 import outcome as real_outcome  # noqa: E402
 
+from contextlib import contextmanager  # noqa: E402
+
+from app.resolver import ResolveError  # noqa: E402
+
+EMPTY_REVIEWS = {"list": [], "distribution": {}, "total": 0}
+
+
+@contextmanager
+def resolver_returns(agent, reviews=None):
+    """Stub server-side resolution so tests never depend on live credentials."""
+    original = main.resolve_agent
+
+    async def fake_resolve(agent_id):
+        return dict(agent), dict(reviews or EMPTY_REVIEWS)
+
+    main.resolve_agent = fake_resolve
+    try:
+        yield
+    finally:
+        main.resolve_agent = original
+
+
+@contextmanager
+def resolver_raises(detail):
+    """Stub a resolution failure (no marketplace session, unknown id, ...)."""
+    original = main.resolve_agent
+
+    async def fake_resolve(agent_id):
+        raise ResolveError(detail)
+
+    main.resolve_agent = fake_resolve
+    try:
+        yield
+    finally:
+        main.resolve_agent = original
+
 
 main.x402.verify_payment = fake_verify
 main.x402.settle_payment = fake_settle
@@ -57,27 +93,57 @@ FULL_AGENT = {
 }
 
 
-def test_empty_body_402_no_settle():
+def test_empty_body_400_no_settle():
     SETTLE_CALLS.clear()
     VERIFY_CALLS.clear()
     r = client.post("/vet_agent", headers={"X-PAYMENT": PAY_HEADER}, json={})
-    assert r.status_code == 402, r.status_code
+    # Business validation errors must NOT be 402 (reserved for payment challenge)
+    assert r.status_code == 400, r.status_code
     body = r.json()
     assert body.get("error") == "invalid_request", body
-    assert "agentId" in body.get("detail", "")
+    assert "agent_id" in body.get("detail", "") or "agentId" in body.get("detail", "")
     assert len(SETTLE_CALLS) == 0, f"settle was called! {SETTLE_CALLS}"
-    print("PASS: empty body -> 402 invalid_request, settle NOT called")
-    print("      verify calls:", len(VERIFY_CALLS), "| settle calls:", len(SETTLE_CALLS))
+    assert len(VERIFY_CALLS) == 0, "verify must not run before body validation"
+    print("PASS: empty body -> 400 invalid_request, settle/verify NOT called")
 
 
-def test_stub_agent_402_no_settle():
+def test_partial_agent_resolves_by_id():
+    """agent_id alone is the buyer contract: a partial object carrying only an
+    id is upgraded to a server-side lookup, not rejected."""
     SETTLE_CALLS.clear()
-    r = client.post("/vet_agent", headers={"X-PAYMENT": PAY_HEADER},
-                    json={"agent": {"agentId": "4984"}})  # missing owner/createdAt
-    assert r.status_code == 402, r.status_code
-    assert r.json().get("error") == "invalid_request"
+    VERIFY_CALLS.clear()
+    with resolver_returns(FULL_AGENT["agent"]):
+        r = client.post("/vet_agent", headers={"X-PAYMENT": PAY_HEADER},
+                        json={"agent": {"agentId": "4984"}})
+    assert r.status_code == 200, (r.status_code, r.text)
+    body = r.json()
+    assert body.get("agent_id") == "4984", body
+    assert isinstance(body.get("trust_score"), int), body
+    assert len(SETTLE_CALLS) == 1, f"expected exactly 1 settle, got {SETTLE_CALLS}"
+    print("PASS: partial agent (id only) -> 200 report via server resolve")
+
+
+def test_unresolvable_id_404_no_settle():
+    """When the id cannot be resolved and the buyer sent no usable snapshot,
+    fail with 404 — never 402, and never charge."""
+    SETTLE_CALLS.clear()
+    VERIFY_CALLS.clear()
+    with resolver_raises("marketplace session unavailable"):
+        r = client.post("/vet_agent", headers={"X-PAYMENT": PAY_HEADER},
+                        json={"agent_id": "4984"})
+    assert r.status_code == 404, (r.status_code, r.text)
+    assert r.json().get("error") == "agent_not_found", r.json()
+    assert len(SETTLE_CALLS) == 0, f"settle was called! {SETTLE_CALLS}"
+    assert len(VERIFY_CALLS) == 0, "verify must not run when resolve failed"
+    print("PASS: unresolvable agent_id -> 404 agent_not_found, settle NOT called")
+
+    # Agent object missing id entirely and incomplete → 400 before verify
+    r2 = client.post("/vet_agent", headers={"X-PAYMENT": PAY_HEADER},
+                     json={"agent": {"name": "x"}})
+    assert r2.status_code == 400, r2.status_code
+    assert r2.json().get("error") == "invalid_request"
     assert len(SETTLE_CALLS) == 0
-    print("PASS: stub agent (partial) -> 402 invalid_request, settle NOT called")
+    print("PASS: incomplete agent without id -> 400 invalid_request")
 
 
 def test_outcome_extracts_payer():
@@ -142,7 +208,8 @@ if __name__ == "__main__":
     test_has_real_data()
     test_engine_withholds_score_on_empty()
     test_outcome_extracts_payer()
-    test_empty_body_402_no_settle()
-    test_stub_agent_402_no_settle()
+    test_empty_body_400_no_settle()
+    test_partial_agent_resolves_by_id()
+    test_unresolvable_id_404_no_settle()
     test_full_agent_settles_and_reports()
     print("\nALL GREEN")

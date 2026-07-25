@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+.env
+.env.*
+.venv
+venv
+.git
+.railway
+openship.json
+render.yaml
+data
+scripts
+diag_*.py
+test_*.py
+*.md

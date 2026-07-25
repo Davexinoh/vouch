@@ -10,7 +10,7 @@
     "securityRate": null,
     "soldCount": 0,
     "services": [
-      {"endpoint": "https://vouch-4ib4.onrender.com/vet_agent"}
+      {"endpoint": "https://vouch-production-cbf2.up.railway.app/vet_agent"}
     ]
   },
   "reviews": {

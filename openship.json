@@ -1,0 +1,10 @@
+{
+  "framework": "fastapi",
+  "buildCommand": "pip install -r requirements.txt",
+  "startCommand": "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1",
+  "port": 8000,
+  "env": {
+    "XLAYER_RPC": "https://xlayerrpc.okx.com",
+    "KEEPALIVE_SECONDS": "0"
+  }
+}
