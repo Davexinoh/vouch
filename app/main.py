@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64 as _b64
 import json as _json
 import os
+import time as _time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +18,7 @@ from .vetting import vet_agent, _has_real_data, REQUIRED_AGENT_FIELDS
 from . import x402
 from .resolver import resolve_agent, ResolveError, resolve_ready
 
-app = FastAPI(title="Vouch", version="1.6.0")
+app = FastAPI(title="Vouch", version="1.7.0")
 
 XLAYER_RPC = os.environ.get("XLAYER_RPC", "")
 VET_PRICE = os.environ.get("VET_PRICE", "1000000")
@@ -83,7 +84,12 @@ def _log_attempt(stage: str, ok: bool, detail: str = "") -> None:
     entry = {"fetched_at": _now_iso(), "stage": stage, "ok": ok,
              "detail": detail[:300]}
     ATTEMPTS.append(entry)
-    print(f"[vouch] {entry}", flush=True)
+    try:
+        print(f"[vouch] {entry}", flush=True)
+    except UnicodeEncodeError:
+        # Non-UTF8 consoles (Windows cp1252) must never fail a request.
+        print(f"[vouch] {entry!r}".encode("ascii", "backslashreplace")
+              .decode("ascii"), flush=True)
 
 
 def _requirements() -> dict:
@@ -137,6 +143,23 @@ def _err(status: int, error: str, detail: str, **extra) -> JSONResponse:
     )
 
 
+# Short-lived resolve cache: the pre-payment check and the paid call for the
+# same agent_id should not pay the CLI/HTTP resolve cost twice.
+_RESOLVE_CACHE: dict[str, tuple[float, dict, dict]] = {}
+RESOLVE_CACHE_TTL = 600.0
+
+
+async def _resolve_cached(agent_id: str) -> tuple[dict, dict]:
+    hit = _RESOLVE_CACHE.get(agent_id)
+    if hit and _time.time() - hit[0] < RESOLVE_CACHE_TTL:
+        return hit[1], hit[2]
+    agent, reviews = await resolve_agent(agent_id)
+    if len(_RESOLVE_CACHE) > 200:
+        _RESOLVE_CACHE.pop(next(iter(_RESOLVE_CACHE)), None)
+    _RESOLVE_CACHE[agent_id] = (_time.time(), agent, reviews)
+    return agent, reviews
+
+
 KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_SECONDS", "300"))
 
 
@@ -151,10 +174,23 @@ async def _self_ping():
         await asyncio.sleep(KEEPALIVE_INTERVAL)
 
 
+async def _warm_cli_session():
+    """Log the onchainos CLI into its AK TEE session before the first paid
+    call, so buyers never eat the login latency."""
+    try:
+        from .cli_resolve import available as cli_available, ensure_ak_login
+        if cli_available() or os.environ.get("ONCHAINOS_BIN"):
+            await asyncio.to_thread(ensure_ak_login)
+            _log_attempt("cli_login", True, "onchainos AK session ready")
+    except Exception as e:
+        _log_attempt("cli_login", False, str(e)[:250])
+
+
 @app.on_event("startup")
 async def _start_keepalive():
     if KEEPALIVE_INTERVAL > 0:
         asyncio.create_task(_self_ping())
+    asyncio.create_task(_warm_cli_session())
 
 
 @app.get("/health")
@@ -163,7 +199,7 @@ async def health():
     return {
         "status": "ok",
         "service": "vouch",
-        "version": "1.6.0",
+        "version": "1.7.0",
         "ready": READY,
         "credentials_configured": x402.credentials_present(),
         "marketplace_resolve": resolve,
@@ -373,7 +409,58 @@ async def vet_agent_post(request: Request):
         request.headers.get("X-PAYMENT")
         or request.headers.get("PAYMENT-SIGNATURE")
     )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    agent_id, agent_obj, reviews, id_err = _extract_request(
+        body if isinstance(body, dict) else {}
+    )
+
     if not pay_header:
+        # --- pre-payment resolvability check (OKX feedback: reject
+        # unresolvable IDs BEFORE the buyer is asked to pay) ---
+        if id_err:
+            _log_attempt("validate", False, id_err)
+            return _err(400, "invalid_agent_id", id_err, schema=REQUEST_SCHEMA)
+        if agent_id is not None:
+            try:
+                await _resolve_cached(agent_id)
+                _log_attempt(
+                    "precheck", True,
+                    f"agent_id={agent_id} resolvable, 402 issued",
+                )
+                return _challenge({
+                    "resolve_precheck": {
+                        "agent_id": agent_id, "resolvable": True,
+                    },
+                })
+            except ResolveError as e:
+                if agent_obj and _has_real_data(agent_obj):
+                    _log_attempt(
+                        "precheck", True,
+                        f"agent_id={agent_id} usable via body snapshot",
+                    )
+                    return _challenge({
+                        "resolve_precheck": {
+                            "agent_id": agent_id, "resolvable": True,
+                            "via": "body_snapshot",
+                        },
+                    })
+                _log_attempt("precheck", False, str(e))
+                return _err(
+                    404,
+                    "agent_not_found",
+                    (
+                        f"agent_id={agent_id} could not be resolved on the OKX "
+                        "marketplace; no payment was requested or taken. "
+                        "Provide a listed agent_id or a full agent object "
+                        f"({', '.join(REQUIRED_AGENT_FIELDS)}). See GET /schema."
+                    ),
+                    agent_id=agent_id,
+                )
         _log_attempt("challenge", True, "unpaid POST, 402 issued")
         return _challenge()
 
@@ -387,15 +474,7 @@ async def vet_agent_post(request: Request):
             "detail": "payment header must be base64-encoded JSON",
         })
 
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
     # --- validate business input BEFORE verify/settle (OKX feedback #4) ---
-    agent_id, agent_obj, reviews, id_err = _extract_request(
-        body if isinstance(body, dict) else {}
-    )
     if id_err:
         _log_attempt("validate", False, id_err)
         return _err(400, "invalid_agent_id", id_err, schema=REQUEST_SCHEMA)
@@ -412,7 +491,7 @@ async def vet_agent_post(request: Request):
     resolved_via = None
     if agent_id is not None:
         try:
-            agent_obj, reviews = await resolve_agent(agent_id)
+            agent_obj, reviews = await _resolve_cached(agent_id)
             resolved_via = "server"
             _log_attempt("resolve", True, f"resolved agent_id={agent_id}")
         except ResolveError as e:
@@ -430,10 +509,10 @@ async def vet_agent_post(request: Request):
                     404,
                     "agent_not_found",
                     (
-                        f"Could not resolve agent_id={agent_id} server-side: {e}. "
-                        "Retry with a full agent object "
-                        f"({', '.join(REQUIRED_AGENT_FIELDS)}) or fix marketplace "
-                        "credentials (OKX_API_KEY / OKX_ACCESS_TOKEN)."
+                        f"agent_id={agent_id} could not be resolved on the OKX "
+                        "marketplace. Payment was NOT settled for this attempt. "
+                        "Retry with a listed agent_id or a full agent object "
+                        f"({', '.join(REQUIRED_AGENT_FIELDS)}). See GET /schema."
                     ),
                     agent_id=agent_id,
                 )

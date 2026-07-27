@@ -12,6 +12,7 @@ shipping ownerAddress/createdAt.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -544,12 +545,14 @@ async def resolve_agent(agent_id: int | str) -> tuple[dict, dict]:
         except Exception as e:
             raise ResolveError(f"resolve proxy failed: {e}") from e
 
-    # 1) onchainos CLI when available — AK login + get-agents (TEE session)
+    # 1) onchainos CLI when available — AK login + get-agents (TEE session).
+    # Runs in a worker thread: the CLI subprocess can take tens of seconds
+    # and must not block the event loop (health checks, other requests).
     cli_err = ""
     try:
         from .cli_resolve import available as cli_available, resolve_agent_cli
         if cli_available() or os.environ.get("ONCHAINOS_BIN"):
-            return resolve_agent_cli(agent_id)
+            return await asyncio.to_thread(resolve_agent_cli, agent_id)
     except ResolveError:
         raise
     except Exception as e:
@@ -623,21 +626,50 @@ async def resolve_agent(agent_id: int | str) -> tuple[dict, dict]:
     return agent, reviews if isinstance(reviews, dict) else {}
 
 
+# Cache CLI wallet-status checks so /health stays fast under polling.
+_READY_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+_READY_TTL = 60.0
+
+
 async def resolve_ready() -> dict:
     """Health helper: can this instance resolve agent_id without body snapshot?"""
+    now = time.time()
+    if _READY_CACHE["value"] is not None and now - _READY_CACHE["at"] < _READY_TTL:
+        return _READY_CACHE["value"]
+
+    result: dict
+    # Preferred: onchainos CLI TEE session (AK login from OKX_API_KEY).
+    try:
+        from .cli_resolve import available as cli_available, wallet_logged_in
+        if cli_available() or os.environ.get("ONCHAINOS_BIN"):
+            logged_in = await asyncio.to_thread(wallet_logged_in)
+            result = {
+                "marketplace_session": logged_in,
+                "via": "onchainos_cli",
+                "has_api_key": bool(_creds()[0]),
+            }
+            _READY_CACHE.update(at=now, value=result)
+            return result
+    except Exception as e:
+        cli_err = str(e)[:240]
+    else:
+        cli_err = ""
+
     try:
         async with httpx.AsyncClient() as client:
             await ensure_session(client)
-        # Smoke: try resolving a known-listed agent cheaply
-        return {
+        result = {
             "marketplace_session": True,
+            "via": "http_session",
             "has_access_token": bool(_session.get("accessToken") or _env_token()),
             "has_api_key": bool(_creds()[0]),
         }
     except Exception as e:
-        return {
+        result = {
             "marketplace_session": False,
             "has_access_token": bool(_session.get("accessToken") or _env_token()),
             "has_api_key": bool(_creds()[0]),
-            "error": str(e)[:240],
+            "error": (cli_err or str(e))[:240],
         }
+    _READY_CACHE.update(at=now, value=result)
+    return result

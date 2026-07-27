@@ -71,9 +71,23 @@ def _run(args: list[str], env: dict[str, str] | None = None, timeout: float = 60
     return data
 
 
+def wallet_logged_in() -> bool:
+    """Cheap session probe for /health."""
+    try:
+        st = _run(["wallet", "status"], timeout=30)
+        return bool(st.get("data", {}).get("loggedIn"))
+    except Exception:
+        return False
+
+
 def ensure_ak_login() -> None:
     global _logged_in
     if _logged_in:
+        return
+    # Reuse an existing session when present (survives process restarts on
+    # hosts with a persistent home dir).
+    if wallet_logged_in():
+        _logged_in = True
         return
     # wallet login without email → AK mode
     try:

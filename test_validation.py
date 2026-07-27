@@ -50,10 +50,12 @@ def resolver_returns(agent, reviews=None):
         return dict(agent), dict(reviews or EMPTY_REVIEWS)
 
     main.resolve_agent = fake_resolve
+    main._RESOLVE_CACHE.clear()  # stub must control the outcome, not the cache
     try:
         yield
     finally:
         main.resolve_agent = original
+        main._RESOLVE_CACHE.clear()
 
 
 @contextmanager
@@ -65,10 +67,12 @@ def resolver_raises(detail):
         raise ResolveError(detail)
 
     main.resolve_agent = fake_resolve
+    main._RESOLVE_CACHE.clear()  # stub must control the outcome, not the cache
     try:
         yield
     finally:
         main.resolve_agent = original
+        main._RESOLVE_CACHE.clear()
 
 
 main.x402.verify_payment = fake_verify
