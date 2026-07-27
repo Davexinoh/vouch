@@ -639,15 +639,13 @@ async def resolve_ready() -> dict:
 
     result: dict
     # Preferred: onchainos CLI TEE session (AK login from OKX_API_KEY).
+    # marketplace_ready() does a real authed read, so a stolen/expired
+    # session is detected AND self-healed right here.
     try:
-        from .cli_resolve import available as cli_available, wallet_logged_in
+        from .cli_resolve import available as cli_available, marketplace_ready
         if cli_available() or os.environ.get("ONCHAINOS_BIN"):
-            logged_in = await asyncio.to_thread(wallet_logged_in)
-            result = {
-                "marketplace_session": logged_in,
-                "via": "onchainos_cli",
-                "has_api_key": bool(_creds()[0]),
-            }
+            result = await asyncio.to_thread(marketplace_ready)
+            result["has_api_key"] = bool(_creds()[0])
             _READY_CACHE.update(at=now, value=result)
             return result
     except Exception as e:

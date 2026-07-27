@@ -13,11 +13,13 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from typing import Any
 
 from .resolver import ResolveError
 
 _logged_in = False
+_login_lock = threading.Lock()
 
 
 def _bin() -> str | None:
@@ -72,7 +74,8 @@ def _run(args: list[str], env: dict[str, str] | None = None, timeout: float = 60
 
 
 def wallet_logged_in() -> bool:
-    """Cheap session probe for /health."""
+    """Local session probe. NOTE: in AK mode `wallet status` does not reliably
+    reflect backend session validity — use marketplace_ready() for /health."""
     try:
         st = _run(["wallet", "status"], timeout=30)
         return bool(st.get("data", {}).get("loggedIn"))
@@ -80,30 +83,50 @@ def wallet_logged_in() -> bool:
         return False
 
 
-def ensure_ak_login() -> None:
+def ensure_ak_login(force: bool = False) -> None:
+    """AK-mode login (wallet login with no email). The TEE backend keeps ONE
+    active session per account — a login elsewhere (e.g. the owner's laptop)
+    expires ours, so callers must be able to force a fresh login."""
     global _logged_in
-    if _logged_in:
-        return
-    # Reuse an existing session when present (survives process restarts on
-    # hosts with a persistent home dir).
-    if wallet_logged_in():
-        _logged_in = True
-        return
-    # wallet login without email → AK mode. No --force: removed in CLI 4.4.0,
-    # and a fresh container has no session to force past anyway.
-    try:
-        _run(["wallet", "login"], timeout=90)
-        _logged_in = True
-    except Exception as e:
-        # already logged in is fine
+    with _login_lock:
+        if _logged_in and not force:
+            return
         try:
-            st = _run(["wallet", "status"], timeout=30)
-            if st.get("data", {}).get("loggedIn"):
+            _run(["wallet", "login"], timeout=90)
+            _logged_in = True
+        except Exception as e:
+            if not force and wallet_logged_in():
                 _logged_in = True
                 return
-        except Exception:
-            pass
-        raise ResolveError(f"onchainos AK login failed: {e}") from e
+            raise ResolveError(f"onchainos AK login failed: {e}") from e
+
+
+def _run_authed(args: list[str], timeout: float = 60) -> dict:
+    """Run an authed CLI command; on 'session expired' re-login once and
+    retry (self-heals when another device stole the TEE session)."""
+    global _logged_in
+    ensure_ak_login()
+    try:
+        return _run(args, timeout=timeout)
+    except ResolveError as e:
+        if "session expired" not in str(e).lower():
+            raise
+        _logged_in = False
+        ensure_ak_login(force=True)
+        return _run(args, timeout=timeout)
+
+
+def marketplace_ready() -> dict:
+    """Real backend probe for /health: run a cheap authed read."""
+    try:
+        _run_authed(["agent", "get-my-agents"], timeout=45)
+        return {"marketplace_session": True, "via": "onchainos_cli"}
+    except Exception as e:
+        return {
+            "marketplace_session": False,
+            "via": "onchainos_cli",
+            "error": str(e)[:240],
+        }
 
 
 def resolve_agent_cli(agent_id: str) -> tuple[dict, dict]:
@@ -111,8 +134,7 @@ def resolve_agent_cli(agent_id: str) -> tuple[dict, dict]:
     if not agent_id.isdigit():
         raise ResolveError(f"agent_id must be numeric, got {agent_id!r}")
 
-    ensure_ak_login()
-    data = _run(["agent", "get-agents", "--agent-ids", agent_id], timeout=60)
+    data = _run_authed(["agent", "get-agents", "--agent-ids", agent_id], timeout=60)
     rows = data.get("data") or []
     if not rows:
         raise ResolveError(f"onchainos get-agents empty for {agent_id}")
@@ -136,7 +158,7 @@ def resolve_agent_cli(agent_id: str) -> tuple[dict, dict]:
 
     reviews: dict[str, Any] = {"list": [], "distribution": {}, "total": 0}
     try:
-        fb = _run(
+        fb = _run_authed(
             ["agent", "feedback-list", "--agent-id", agent_id, "--page-size", "50"],
             timeout=45,
         )
@@ -154,7 +176,7 @@ def resolve_agent_cli(agent_id: str) -> tuple[dict, dict]:
         pass
 
     try:
-        svc = _run(["agent", "service-list", "--agent-id", agent_id], timeout=45)
+        svc = _run_authed(["agent", "service-list", "--agent-id", agent_id], timeout=45)
         # shape: data[0].list
         d0 = (svc.get("data") or [{}])[0] if isinstance(svc.get("data"), list) else svc.get("data")
         if isinstance(d0, dict):
