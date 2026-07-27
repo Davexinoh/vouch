@@ -89,9 +89,10 @@ def ensure_ak_login() -> None:
     if wallet_logged_in():
         _logged_in = True
         return
-    # wallet login without email → AK mode
+    # wallet login without email → AK mode. No --force: removed in CLI 4.4.0,
+    # and a fresh container has no session to force past anyway.
     try:
-        _run(["wallet", "login", "--force"], timeout=90)
+        _run(["wallet", "login"], timeout=90)
         _logged_in = True
     except Exception as e:
         # already logged in is fine
